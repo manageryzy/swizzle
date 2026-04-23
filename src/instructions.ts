@@ -25,6 +25,13 @@ export type Dtype =
 export type OperandSource = 'smem' | 'rmem' | 'tmem' | 'gmem-wmma';
 export type Major = 'K' | 'MN';
 
+// Pipeline regime — drives whether producer (tma.load / cp.async) and consumer
+// (mma step) execute in parallel warps (`warpspec`) or serially in the same
+// warp (`coupled`). sm_90 wgmma and sm_100 tcgen05 kernels ship their
+// CollectiveMma wrapped in `MainloopSm90Tma*` / `MainloopSm100Tma*` which
+// uses two warp groups + mbarrier; sm_70 wmma and sm_80 mma do not.
+export type PipelineMode = 'warpspec' | 'coupled';
+
 // Whether a catalog entry is shipped as a canonical cute atom or is reachable
 // only through the PTX-level shape rules. CUTLASS headers only expose 8 N
 // values for wgmma (the `atom` subset); PTX §9.7.15.5.2 also allows every
@@ -52,6 +59,8 @@ export interface InstSpec {
   sparse?: boolean;
   warpSpecialized?: boolean;
   shapeSource?: ShapeSource;
+  /** warpspec (producer∥consumer warps, mbarrier coord) or coupled (one warp, serial). */
+  pipelineMode: PipelineMode;
   source: string; // reference to CUTLASS file
 }
 
@@ -93,6 +102,7 @@ function wgmmaF16(N: number, acc: 'fp32' | 'fp16', shapeSource: ShapeSource): In
     majorA: ['K', 'MN'],
     majorB: ['K', 'MN'],
     shapeSource,
+    pipelineMode: 'warpspec',
     source: 'cute/arch/mma_sm90_gmma.hpp',
   };
 }
@@ -158,6 +168,7 @@ function tcgen05Mma(
     ctaGroup: cta,
     sparse,
     warpSpecialized: ws,
+    pipelineMode: 'warpspec',
     source: 'cute/arch/mma_sm100_umma.hpp',
   };
 }
@@ -234,6 +245,7 @@ export const INSTRUCTIONS: InstSpec[] = [
     accIn: 'rmem',
     majorA: ['K', 'MN'],
     majorB: ['K', 'MN'],
+    pipelineMode: 'coupled',
     source: 'cutlass/arch/wmma_sm70.h',
   },
   {
@@ -252,6 +264,7 @@ export const INSTRUCTIONS: InstSpec[] = [
     accIn: 'rmem',
     majorA: ['K'],
     majorB: ['K'],
+    pipelineMode: 'coupled',
     source: 'cutlass/arch/wmma_sm72.h',
   },
 
@@ -272,6 +285,7 @@ export const INSTRUCTIONS: InstSpec[] = [
     accIn: 'rmem',
     majorA: ['K'],
     majorB: ['MN'],
+    pipelineMode: 'coupled',
     source: 'cute/atom/mma_traits_sm80.hpp',
   },
   {
@@ -290,6 +304,7 @@ export const INSTRUCTIONS: InstSpec[] = [
     accIn: 'rmem',
     majorA: ['K'],
     majorB: ['MN'],
+    pipelineMode: 'coupled',
     source: 'cute/atom/mma_traits_sm80.hpp',
   },
   {
@@ -308,6 +323,7 @@ export const INSTRUCTIONS: InstSpec[] = [
     accIn: 'rmem',
     majorA: ['K'],
     majorB: ['MN'],
+    pipelineMode: 'coupled',
     source: 'cute/atom/mma_traits_sm89.hpp',
   },
 

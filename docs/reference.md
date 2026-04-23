@@ -149,3 +149,180 @@ fp16 (sm_70), int8 (sm_72), int4 / uint1 (sm_75). Source: `cutlass/arch/wmma_sm{
 This is the pattern the demo's `ConfigBar` mirrors: the user picks an arch +
 instruction + schedule, and the panels derive the collective that would be
 selected.
+
+## 9. Tile hierarchy (what the `TileHierarchyPanel` visualises)
+
+Every CUTLASS GEMM is a composition of four tile levels:
+
+1. **Problem shape** `(M, N, K)` — the whole matmul `C += A · B`.
+2. **ClusterShape** `(CLUSTER_M, CLUSTER_N, CLUSTER_K)` — the grid of cooperating CTAs. For sm_100 tcgen05 `cta_group::2` this is `(2,1,1)`; for plain sm_90 it is `(1,1,1)`.
+3. **TileShape** `(BLK_M, BLK_N, BLK_K)` — the M/N/K covered by a single CTA.
+   - Each CTA's output tile is `BLK_M × BLK_N` of `C`.
+   - The CTA walks `numIters = ceil(K / BLK_K)` steps along K, producing a new K-slice of A (`BLK_M × BLK_K`) and B (`BLK_K × BLK_N`) per iter.
+   - SMEM holds `PIPE = kStages` ring slots of those slices.
+4. **Atom shape** `(atom_M, atom_N, atom_K)` — the MMA instruction (`wgmma.m64n128k16`, `tcgen05.mma.m128n128k16`, ...).
+
+CUTLASS `TiledMMA<AtomLayoutMNK>` fans the atoms across the CTA tile. The
+demo models `AtomLayoutMNK = (blkMMult, blkNMult, 1)` — integer multiples
+only. The `TILE` selectors in ConfigBar set these multipliers.
+
+- `Problem` → not drawn at scale; the TileHierarchyPanel Row 1 uses a 4×4
+  schematic to show one CTA's position relative to its peers.
+- `ClusterShape` → Row 1 outlines neighboring CTAs in the same cluster.
+- `TileShape` → Row 2 shows each K slot as a column; Row 3 shows the CTA
+  tile subdivided into atoms.
+- `Atom` → one atom cell in Row 3; the currently-executing atom is yellow.
+- `PIPE` → Row 2 slot colour: consume (yellow) / in-flight fill (green) /
+  hold / drained.
+
+Key CUTLASS APIs the panel maps to:
+- `cute::local_tile(mA, make_shape(BLK_M, BLK_K), tile_coord)` — carves the
+  CTA tile out of the GMEM A tensor.
+- `cute::TiledMMA<AtomLayoutMNK, ValLayoutMNK>` — defines how atoms fan out
+  to produce one CTA output tile. See `cute/atom/atom.hpp`.
+- `cutlass::gemm::collective::StageCountAuto` — computes `kStages = PIPE`
+  from the SMEM budget formula modelled in `src/smem_budget.ts`.
+
+Naming map (UI ↔ CUTLASS):
+
+| UI signal / label | CUTLASS name |
+|---|---|
+| `InstSpec.M, .N, .K` | atom shape `(atom_M, atom_N, atom_K)` |
+| `blkMMult, blkNMult` | `AtomLayoutMNK_M`, `AtomLayoutMNK_N` |
+| derived `BLK_M = InstSpec.M × blkMMult` | `TileShape_M` |
+| derived `BLK_N = InstSpec.N × blkNMult` | `TileShape_N` |
+| `tileK` | `TileShape_K` aka `BLK_K` |
+| `kStages` | `PIPE` (aka `StageCount`) |
+| `ctaGroup` (tcgen05 flag) | `ClusterShape_M` (when = 2) |
+| `problemMMult, problemNMult, problemKMult` | problem-to-CTA-tile multiplier (shapes the GMEM rectangle) |
+| `ctaGrid.rowsM/colsN/slicesK` | `cute::ceil_div(Problem, BLK)` grid dimensions |
+
+## 10. Pipeline regimes (warpspec vs coupled)
+
+NVIDIA GPUs have two distinct matmul pipeline shapes, and v3 of the
+visualizer distinguishes them explicitly. Every `InstSpec` carries
+`pipelineMode: 'warpspec' | 'coupled'`.
+
+### `warpspec` — sm_90 wgmma, sm_100 tcgen05
+
+One warpgroup (4 warps, 128 threads) is the **producer**: it only issues
+`cp.async.bulk.tensor` (TMA). A different warpgroup is the **consumer**: it
+only issues `wgmma.mma_async` (sm_90) or `tcgen05.mma` (sm_100). They
+coordinate through an `mbarrier` ring (`PipelineTmaAsync<PIPE>` in
+`cutlass/pipeline/sm90_pipeline.hpp`):
+
+```
+producer: producer_acquire(stage) → tma_load(sA(_,_,_,stage)) → mbar.arrive(stage)
+consumer: mbar.wait(stage) → wgmma(sA(_,_,_,stage)) → ++stage
+```
+
+The two streams execute **concurrently in wall-clock time**. Once the ring
+is primed, the producer is `PIPE − 1` K-slices ahead of the consumer. This
+overlap is the reason CUTLASS kernels reach close to peak throughput on
+Hopper/Blackwell, and is modelled in `pipeline_state.ts · emitTimeline()`
+as two non-serialized `TimelinePhase[]` arrays whose `startTick`/`endTick`
+ranges overlap.
+
+CUTLASS wrappers that set this regime: `MainloopSm90TmaGmmaWarpSpecialized`,
+`MainloopSm100TmaUmmaWarpSpecialized*`.
+
+### `coupled` — sm_70 wmma, sm_80 mma.sync
+
+A single warp issues the whole chain: `cp.async` (or `ld.global`) → `ldmatrix`
+→ `mma.sync` → repeat. No mbarrier, no ring depth beyond 1, no parallelism
+between load and compute. `emitTimeline()` produces strictly serial phases
+in this regime: for each K slice, `producer.endTick ≤ consumer.startTick`.
+
+### What the UI shows
+
+- **ConfigBar** right-side pill: teal `ASYNC · producer ∥ consumer` for
+  warpspec, gray `SYNC · same warp` for coupled.
+- **Timeline** swim lanes: under warpspec the producer and consumer bars
+  overlap on the tick axis; under coupled they tessellate end-to-end.
+  The mbarrier row only populates for warpspec.
+- **TileHierarchyPanel Row 2**: warpspec shows **two cursors** (solid
+  consumer, dotted producer) walking K at different rates; coupled shows
+  a single cursor.
+- **MemFlowPanel**: warpspec can light multiple edges simultaneously
+  (producer `tmaA` + consumer `descA` at the same tick); coupled lights
+  one at a time.
+
+## 11. GMEM ↔ SMEM under `Swizzle<B,M,S>` (what `GmemPanel` visualises)
+
+The GmemPanel sits above SmemPanel so the reader sees the full story:
+GMEM tile → SMEM line (under swizzle) → SMEM banks → warp fragment.
+
+Three tracks per operand (A, B) plus a C-tile destination track:
+
+1. **GMEM tile** — the M×K (A) or K×N (B) rectangle gridded at CTA-tile
+   boundaries. "This CTA" at (0,0) is highlighted; rainbow stripes color
+   each logical SMEM line of the currently-loading K slab.
+2. **Arrows** — one arrow per logical SMEM line, pointing at its physical
+   line index under the active `Swizzle<B,M,S>`. The arrow endpoint y
+   coordinate is `apply(sw, line_index × 128) / 128`. Under SW128 the
+   rainbow reshuffles; under NO_SWIZZLE the arrows are horizontal.
+3. **SMEM physical lines** — stack ordered by physical line index. Each
+   line is colored by its *source* GMEM row, so the reader sees the
+   shuffle visually.
+
+Below the three tracks: an **element-level bank legend** showing one GMEM
+row (32 × 4-byte words for a 128 B coalesced load) colored by target SMEM
+bank after the swizzle remap. This is the visual answer to "which word goes
+in which bank under swizzle?" — exactly the question TMA/cp.async.bulk.tensor
+has to answer at runtime when writing into SMEM.
+
+The C-tile destination track at the bottom mirrors the same idea for the
+store path: during `epilogue.tma.store`, a green drain bar shows this CTA's
+C tile being written to its `(m, n)` location in the problem-sized C tensor.
+
+Related CUTLASS / PTX references:
+- `cute/arch/mma_sm90_gmma.hpp` — canonical `Layout_K_SW128_Atom<T>` atoms
+  the swizzle map mirrors.
+- PTX ISA §9.7.9 `cp.async.bulk.tensor` — TMA descriptor box-dim walking.
+- `cute::TMA_LOAD_IM2COL` — not modelled here; we stay with the plain
+  box-tile case.
+
+## 12. Simulation model (v4 — what `src/simulation.ts` tracks)
+
+Every panel's animations are driven by a single `WorldState` snapshot returned
+by `simulate(SimInput).worldAt(tick)`. The simulator is a pure, event-driven
+function: phase boundaries emit effects, and `worldAt` applies all effects
+≤ tick plus linear interpolation within the active phase of each stream.
+
+### WorldState fields
+
+- `active`: the current producer / consumer / epilogue phase per stream (null if idle on that stream).
+- `progress`: per-stream fraction 0..1 inside the active phase.
+- `ring[stage]`: per-stage `{slice, role ∈ {empty, fill, hold, consume}, fillFrac}`. Length 0 for wmma, length 1 for sm_80 mma, length kStages for warpspec.
+- `mbar[stage]`: full/empty + lastArriveTick/lastWaitTick. Length matches ring.
+- `producerTransfer`: `{kind: tma/cpasync/wmma-load/ldmatrixA/tcgen05-cp/metadata/scale, kSlab, operand, stage, linesLoaded, linesTotal}`. Null outside producer phases.
+- `consumerAtom`: `{kSlab, kStep, kAtomInSlab, stage, atomM, atomN, atomFlatIdx, laneWave, maxWays}`. Null outside consumer phases.
+- `cTile.accumulated[m][n]`: count of k-steps that have accumulated into that MN atom's C cell. Caps at slabCount × atomsPerStage_K.
+- `cTile.epilogueStaged[m][n]` and `epilogueDrained[m][n]`: 0..1 row-major sweeps during `stg_smem` and `tma.store`.
+- `warps[]`: per-warp role `{producer/consumer/epilogue/idle}`. Length 1 for mma/wmma, 4 for warpgroup. Under `.ws`, warp 0 = producer, warps 1..3 = consumer when their respective phases are active.
+- `cluster`: non-null for `ctaGroup=2` clusters. `{thisCtaRole, peerActive, sharedLoad}`.
+- `auxiliary`: `{metadata: bool, scaleA: bool, scaleB: bool}` flags for sparse / block_scaled.
+
+### Execution semantics by variant
+
+- **wmma-direct (sm_70/72/75)**: producer emits `wmma.load_matrix_sync` per k-atom; consumer `wmma.mma.sync` per k-atom; epilogue `wmma.store_matrix_sync`. No ring, no mbar, no SMEM.
+- **cpasync-mma (sm_80/89)**: `cp.async` + `ldmatrix` per k-atom; `mma.sync` per k-atom; `st.global` epilogue. Synthetic 1-slot ring.
+- **warpspec-SS (wgmma / tcgen05 aSource=smem)**: 1 `tma.load` per slab fills `ring[stage]`; `atomsPerStage_K` mma.step per slab via descriptor. Ring kStages-deep.
+- **warpspec-RS (wgmma aSource=rmem)**: same + `atomsPerStage_K` `ldmatrix-A` sub-phases hoisted before each mma.step.
+- **warpspec-TS (tcgen05 aSource=tmem)**: same + 1 `tcgen05.cp` sub-phase per slab (SMEM A → TMEM A).
+- **cg2**: 1 multicast `tma.load` per slab feeds two CTAs; `cluster.peerActive` set; epilogue writes disjoint halves.
+- **.ws (tcgen05 cg1 warpSpecialized=true)**: warp 0 handles producer; warps 1–3 handle consumer; simultaneous.
+- **sparse (.sp)**: extra metadata `tma.load` per slab.
+- **block_scaled**: extra SFA + SFB `tma.loads` per slab.
+
+### What remains schematic (from plan §I)
+
+- PTX cycle counts are nominal (TMA=4, MMA=2 ticks etc.), not hardware-measured.
+- Mbarrier transactions have zero latency.
+- TMA descriptor box-dim walking is atomic per phase.
+- Lane-wave bank-conflict replay uses the pattern level; sub-warp scheduling within a collision is not tracked.
+- RF bank write-port contention is not modelled.
+- Cluster-wide TMEM coherence is shown as mirrored state.
+- Problem-level CTA grid walking: this CTA fixed at (0, 0).
+- Epilogue drain order within a CTA is row-major; real kernels may permute.
+- Fragment tracking per lane is a stub (`world.warps[].fragment` is always `'none'`).

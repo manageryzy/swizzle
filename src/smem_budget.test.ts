@@ -100,3 +100,27 @@ describe('kIterations is tileK / kAtomK', () => {
     expect(kIterations(wgmma, 20)).toBe(2);
   });
 });
+
+describe('CUTLASS TileShape multipliers (TiledMMA AtomLayoutMNK)', () => {
+  it('stageBytes(inst, {2,2}) scales A and B by their respective multiplier', () => {
+    const base = stageBytes(wgmma);
+    const tiled = stageBytes(wgmma, { blkMMult: 2, blkNMult: 2 });
+    expect(tiled.a).toBe(base.a * 2);
+    expect(tiled.b).toBe(base.b * 2);
+    // pair re-aligns A+B together; both doubled → pair doubles too.
+    expect(tiled.pair).toBe(base.pair * 2);
+  });
+
+  it('maxStages drops roughly proportionally when BLK_M doubles', () => {
+    const n0 = maxStages(wgmma, 0);
+    const n1 = maxStages(wgmma, 0, { blkMMult: 2 });
+    // BLK_M doubles → A doubles → stage_bytes ≈ (2A + B + mbar)/(A + B + mbar);
+    // n1 strictly less than n0 (and bounded above by half of n0 + slack).
+    expect(n1).toBeLessThan(n0);
+    expect(n1).toBeGreaterThan(0);
+  });
+
+  it('stageBytes default (no mult) == stageBytes({1,1})', () => {
+    expect(stageBytes(wgmma)).toEqual(stageBytes(wgmma, { blkMMult: 1, blkNMult: 1 }));
+  });
+});

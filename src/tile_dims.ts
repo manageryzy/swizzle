@@ -20,10 +20,13 @@ export function tileDimsFor(
   i: InstSpec,
   operand: 'A' | 'B',
   major: Major,
+  outerMult: number = 1,
 ): TileDims {
   const dtype = operand === 'A' ? i.aDtypes[0] : i.bDtypes[0];
   const elemBytes = bytesOf(dtype);
-  const outer = operand === 'A' ? i.M : i.N;
+  // `outerMult` is the BLK_M / BLK_N multiplier from the CUTLASS TiledMMA;
+  // by default 1 (one atom per CTA, original behaviour).
+  const outer = (operand === 'A' ? i.M : i.N) * Math.max(1, outerMult);
   const inner = i.K;
   const totalBytes = Math.ceil(outer * inner * elemBytes);
 

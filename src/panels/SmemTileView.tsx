@@ -3,22 +3,28 @@ import {
   activePattern,
   activeSwizzleA,
   activeSwizzleB,
+  blkMMult,
+  blkNMult,
   currentAccesses,
-  currentKStep,
-  currentPhase,
+  currentConsumerPhase,
+  currentEpiloguePhase,
+  currentProducerPhase,
+  epiloguePhaseProgress,
   focusedOffset,
   inst,
+  producerPhaseProgress,
   phaseProgress,
   spec,
+  world,
 } from '../state';
 import { apply } from '../swizzle';
 import { accessArrival, contiguousArrival, type Access } from '../patterns';
 import { tileDimsFor } from '../tile_dims';
 import type { Major } from '../instructions';
 
-const MAX_ROWS = 64;
-const MAX_COLS = 64;
-const MIN_CELL = 3;
+const MAX_ROWS = 256;
+const MAX_COLS = 256;
+const MIN_CELL = 2;
 const MAX_CELL = 10;
 const BANK_WORDS_PER_LINE = 32; // 32 banks × 4 B = 128 B per line
 const BYTES_PER_WORD = 4;
@@ -63,13 +69,26 @@ export function SmemTileView({ operand, view, sliceIdx = 0 }: SmemTileViewProps)
   const s = spec.value;
   const _p = activePattern.value;
   const i = inst.value;
-  const phase = currentPhase.value;
-  const progress = phaseProgress.value;
-  const kStep = currentKStep.value;
+  // Pick the currently-driving phase AND its per-stream progress — so the
+  // animation speed matches the stream that owns the phase kind. Under
+  // warpspec, producer (TMA / ldmatrix) and consumer (mma.step) overlap in
+  // wall-clock ticks and advance at different rates.
+  const cProd = currentProducerPhase.value;
+  const cCons = currentConsumerPhase.value;
+  const cEpi = currentEpiloguePhase.value;
+  const pProg = producerPhaseProgress.value;
+  const cProg = phaseProgress.value; // consumer-priority
+  const eProg = epiloguePhaseProgress.value;
+  const w = world.value;
+  const kStep = w.consumerAtom ? { k: w.consumerAtom.kStep, total: 1 } : null;
   const accesses = currentAccesses.value;
 
   const major: Major = operand === 'A' ? s.majorA : s.majorB;
-  const dims = tileDimsFor(i, operand, major);
+  const outerMult = operand === 'A' ? blkMMult.value : blkNMult.value;
+  const dims = tileDimsFor(i, operand, major, outerMult);
+  // Atom-boundary lines split the BLK_M/BLK_N tile into its constituent
+  // atoms — visible only when outerMult > 1.
+  const atomOuter = operand === 'A' ? i.M : i.N;
   // Per-operand effective swizzle — the byte-level M shifts with element size
   // (fp16 → M=1, fp32 → M=2, fp8 → M=0), so A and B can disagree in mixed-
   // precision kernels.
@@ -91,12 +110,26 @@ export function SmemTileView({ operand, view, sliceIdx = 0 }: SmemTileViewProps)
   const W = cols * CELL;
   const H = rows * CELL;
 
-  const isPhase = phase?.kind;
-  const isMmaStep = isPhase === 'wgmma.step' || isPhase === 'tcgen05.mma.step';
-  const isLoad = isPhase === 'tma.load' || isPhase === 'cp.async';
-  const isEpiFill = isPhase === 'epilogue.stg_smem';
-  const isEpiDrain = isPhase === 'epilogue.tma.store';
-  const isWarpRead = isPhase === 'ldmatrix';
+  // Determine active phase kind + its per-stream progress. Producer phases
+  // (tma.load, cp.async, ldmatrix, wmma.load) use producer progress; consumer
+  // phases use consumer progress; epilogue uses epilogue progress. Under
+  // warpspec more than one may be live simultaneously — we surface them
+  // independently so an mma-step pulse can animate at the consumer rate even
+  // while a TMA-load dim-ramp animates at the producer rate.
+  const prodKind = cProd?.kind;
+  const consKind = cCons?.kind;
+  const epiKind = cEpi?.kind;
+  const isLoad = prodKind === 'tma.load' || prodKind === 'cp.async' || prodKind === 'wmma.load';
+  const isWarpRead = prodKind === 'ldmatrix';
+  const isMmaStep = consKind === 'wgmma.step' || consKind === 'tcgen05.mma.step';
+  const isEpiFill = epiKind === 'epilogue.stg_smem';
+  const isEpiDrain = epiKind === 'epilogue.tma.store';
+  const isPhase = consKind ?? epiKind ?? prodKind;
+  // Per-overlay progress — each animation reads from its own stream.
+  const loadProg = pProg;
+  const warpReadProg = pProg;
+  const mmaProg = cProg;
+  const epiProg = eProg;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -147,16 +180,74 @@ export function SmemTileView({ operand, view, sliceIdx = 0 }: SmemTileViewProps)
         ctx.lineTo(W, r * CELL);
         ctx.stroke();
       }
+      // Bank column separators every 8 banks (at byte boundaries 32, 64, 96).
+      ctx.strokeStyle = 'rgba(126, 156, 216, 0.22)';
+      for (let c = 8; c < cols; c += 8) {
+        ctx.beginPath();
+        ctx.moveTo(c * CELL, 0);
+        ctx.lineTo(c * CELL, H);
+        ctx.stroke();
+      }
+    }
+
+    // Atom-boundary lines: when BLK_M / BLK_N > atom_M / atom_N, the SMEM
+    // tile holds multiple atoms along the outer axis. Draw thin dividers so
+    // the reader sees that one CTA tile = many atoms (the TiledMMA picture).
+    if (outerMult > 1 && view === 'logical' && CELL >= 3) {
+      ctx.strokeStyle = 'rgba(255, 216, 120, 0.35)';
+      ctx.lineWidth = 1;
+      if (major === 'K') {
+        // outer = rows; lines every atomOuter rows.
+        for (let r = atomOuter; r < rows; r += atomOuter) {
+          ctx.beginPath();
+          ctx.moveTo(0, r * CELL);
+          ctx.lineTo(W, r * CELL);
+          ctx.stroke();
+        }
+      } else {
+        // outer is the fast axis (cols span outer in 4B-cell counts).
+        const elemBytes = dims.elemBytes;
+        const cellsPerAtomOuter = Math.max(1, Math.ceil((atomOuter * elemBytes) / BYTES_PER_WORD));
+        for (let c = cellsPerAtomOuter; c < cols; c += cellsPerAtomOuter) {
+          ctx.beginPath();
+          ctx.moveTo(c * CELL, 0);
+          ctx.lineTo(c * CELL, H);
+          ctx.stroke();
+        }
+      }
+    }
+
+    // Dtype-aware sub-cell dividers: one 4-B cell may hold multiple elements
+    // (fp16 → 2, fp8 → 4, int4/fp4 → 8). Draw faint vertical ticks so the
+    // reader can see that the "swizzle is bytewise" narrative applies to
+    // whole words, not elements.
+    const eb = dims.elemBytes;
+    if (eb > 0 && eb < BYTES_PER_WORD && CELL >= 6) {
+      const subDiv = BYTES_PER_WORD / eb;
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+      ctx.lineWidth = 0.5;
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          for (let d = 1; d < subDiv; d++) {
+            const x = c * CELL + (CELL * d) / subDiv;
+            ctx.beginPath();
+            ctx.moveTo(x, r * CELL + 1);
+            ctx.lineTo(x, (r + 1) * CELL - 2);
+            ctx.stroke();
+          }
+        }
+      }
     }
 
     // Lane access overlay. Both views project the per-lane byte offset: on
     // LOGICAL → (row, col) of the access; on PHYSICAL → (line, bank_word) of
-    // the swizzled offset.
-    if (isWarpRead || isPhase === 'cp.async') {
+    // the swizzled offset. Both run on the producer stream (TMA fill or
+    // ldmatrix into regs), so we use producer progress.
+    if (isWarpRead || prodKind === 'cp.async') {
       ctx.lineWidth = Math.max(1, Math.floor(CELL / 6));
       const sched = isWarpRead ? accessArrival(accesses, sw) : contiguousArrival(accesses);
       const waveCount = Math.max(1, sched.waveCount);
-      const cur = progress * waveCount;
+      const cur = warpReadProg * waveCount;
       for (const a of accesses) {
         const w = sched.wavePerLane.get(a.laneId) ?? 0;
         const fade = Math.max(0, Math.min(1, (cur - w) * 3));
@@ -181,35 +272,36 @@ export function SmemTileView({ operand, view, sliceIdx = 0 }: SmemTileViewProps)
       ctx.globalAlpha = 1;
     }
 
-    // mma atom pulse (on both views).
+    // mma atom pulse (on both views) — uses CONSUMER progress, so the pulse
+    // speeds up / slows down independently of any concurrent TMA load.
     if (isMmaStep && kStep) {
-      const pulse = 0.35 + 0.25 * Math.sin(progress * Math.PI);
+      const pulse = 0.35 + 0.25 * Math.sin(mmaProg * Math.PI);
       ctx.strokeStyle = `rgba(255, 216, 120, ${pulse})`;
       ctx.lineWidth = 2;
       ctx.strokeRect(1, 1, W - 2, H - 2);
     }
 
-    // TMA dim-to-bright ramp.
+    // TMA dim-to-bright ramp — uses PRODUCER progress.
     if (isLoad) {
-      const tmaDim = 0.35 + 0.45 * Math.min(1, progress * 1.1);
+      const tmaDim = 0.35 + 0.45 * Math.min(1, loadProg * 1.1);
       if (tmaDim < 1) {
         ctx.fillStyle = `rgba(13, 16, 23, ${1 - tmaDim})`;
         ctx.fillRect(0, 0, W, H);
       }
     }
 
-    // Epilogue fill / drain (LOGICAL view: L→R fill; PHYSICAL view: drain).
+    // Epilogue fill / drain — uses EPILOGUE progress.
     if (isEpiFill) {
-      const fillCols = Math.ceil(cols * progress);
+      const fillCols = Math.ceil(cols * epiProg);
       ctx.fillStyle = 'rgba(255, 200, 120, 0.30)';
       ctx.fillRect(0, 0, fillCols * CELL, H);
     }
     if (isEpiDrain) {
-      const drainCols = Math.ceil(cols * progress);
+      const drainCols = Math.ceil(cols * epiProg);
       ctx.fillStyle = 'rgba(13, 16, 23, 0.50)';
       ctx.fillRect((cols - drainCols) * CELL, 0, drainCols * CELL, H);
     }
-  }, [sw.B, sw.M, sw.S, s, _p.id, accesses, isMmaStep, isLoad, isWarpRead, isEpiFill, isEpiDrain, isPhase, progress, kStep?.k, kStep?.total, dims.rows, dims.cols, dims.rowStrideBytes, dims.tileBytes, CELL, view, rows, cols, W, H, operand, major, logicalCols, sliceIdx]);
+  }, [sw.B, sw.M, sw.S, s, _p.id, accesses, isMmaStep, isLoad, isWarpRead, isEpiFill, isEpiDrain, isPhase, loadProg, mmaProg, epiProg, warpReadProg, kStep?.k, kStep?.total, dims.rows, dims.cols, dims.rowStrideBytes, dims.tileBytes, dims.elemBytes, CELL, view, rows, cols, W, H, operand, major, logicalCols, sliceIdx, outerMult, atomOuter]);
 
   function onMove(e: MouseEvent) {
     const canvas = canvasRef.current;

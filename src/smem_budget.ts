@@ -65,8 +65,22 @@ export function tileBytesRaw(rows: number, cols: number, dtype: Dtype): number {
   return Math.ceil(rows * cols * bytesOf(dtype));
 }
 
+// Tile multipliers for CUTLASS `TiledMMA<AtomLayoutMNK>`. The MMA atom is
+// `inst.M × inst.K` for A and `inst.N × inst.K` for B; one CTA often holds
+// many atoms along M and/or N, which scales the per-stage SMEM cost.
+// Default {1, 1} preserves pre-v2 behaviour.
+export interface TileMult {
+  blkMMult?: number;
+  blkNMult?: number;
+}
+
 // Exposed for the UI: size of one A+B pair, aligned to 128, + mbar overhead.
-export function stageBytes(i: InstSpec): {
+// When `mult.blkMMult` / `mult.blkNMult` > 1, the CTA tile covers more than
+// one atom in M / N, growing A and B accordingly.
+export function stageBytes(
+  i: InstSpec,
+  mult: TileMult = {},
+): {
   a: number;
   b: number;
   pair: number;     // round_up(a+b, 128)
@@ -74,10 +88,12 @@ export function stageBytes(i: InstSpec): {
   mbar: number;
   stage: number;    // pair + mbar, as the builder uses
 } {
+  const bm = mult.blkMMult ?? 1;
+  const bn = mult.blkNMult ?? 1;
   const dtypeA = i.aDtypes[0];
   const dtypeB = i.bDtypes[0];
-  const a = tileBytesRaw(i.M, i.K, dtypeA);
-  const b = tileBytesRaw(i.N, i.K, dtypeB);
+  const a = tileBytesRaw(i.M * bm, i.K, dtypeA);
+  const b = tileBytesRaw(i.N * bn, i.K, dtypeB);
   const pair = alignUp(a + b);
   const pad = pair - a - b;
   const mbar = MAINLOOP_PIPELINE_BYTES_PER_STAGE;
@@ -101,9 +117,9 @@ export interface Budget {
   fits: boolean;
 }
 
-export function buildBudget(i: InstSpec, stages: number): Budget {
+export function buildBudget(i: InstSpec, stages: number, mult: TileMult = {}): Budget {
   const total = SMEM_PER_SM[i.arch];
-  const sb = stageBytes(i);
+  const sb = stageBytes(i, mult);
 
   const segments: Segment[] = [];
   for (let s = 0; s < stages; s++) {
@@ -124,8 +140,8 @@ export function buildBudget(i: InstSpec, stages: number): Budget {
 
 // Recommended max stages that fit in SMEM. Mirrors the CUTLASS AutoCarveout
 // division: (capacity - carveout) / stage_bytes. carveout=0 baseline.
-export function maxStages(i: InstSpec, carveoutBytes = 0): number {
-  const sb = stageBytes(i);
+export function maxStages(i: InstSpec, carveoutBytes = 0, mult: TileMult = {}): number {
+  const sb = stageBytes(i, mult);
   const capacity = SMEM_PER_SM[i.arch];
   if (sb.stage <= 0) return 1;
   return Math.max(1, Math.floor((capacity - carveoutBytes) / sb.stage));

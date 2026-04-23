@@ -1,10 +1,16 @@
-import { activePattern, activeSwizzle, activeTileDims, currentAccesses, currentConflicts, maxConflict } from '../state';
+import {
+  activePattern,
+  activeSwizzle,
+  activeTileDims,
+  currentAccesses,
+  maxConflict,
+} from '../state';
 import { maxConflictWay } from '../patterns';
 import { SWIZZLES, type SwizzleKind, effectiveSwizzle } from '../swizzle';
 import { spec } from '../state';
+import { TruthFooter } from './TruthFooter';
 
 export function ConflictMeter() {
-  const cs = currentConflicts.value;
   const way = maxConflict.value;
   const sw = activeSwizzle.value;
   const pat = activePattern.value;
@@ -13,9 +19,6 @@ export function ConflictMeter() {
 
   const status = way === 1 ? 'none' : way <= 2 ? 'mild' : way <= 4 ? 'moderate' : 'severe';
 
-  // Per-swizzle leaderboard for the current pattern. Use the element-size of
-  // the active operand so the ranking matches what the SMEM panel renders
-  // (fp8/fp32 shift M and change the conflict picture).
   const elemBytes = activeTileDims.value.elemBytes;
   const allWays: { kind: SwizzleKind; way: number }[] = (
     Object.keys(SWIZZLES) as SwizzleKind[]
@@ -25,24 +28,19 @@ export function ConflictMeter() {
   return (
     <div class="panel">
       <h3>
-        Conflicts <small>— max lanes colliding on a single bank</small>
+        Swizzle leaderboard <small>— tap a row to switch</small>
       </h3>
-
-      <div class="conflict-meter">
-        <div class={`conflict-meter__way conflict-meter__way--${status}`}>
-          {way === 1 ? 'no conflict' : `${way}-way`}
-        </div>
-        <div class="conflict-meter__detail">
-          pattern <code>{pat.id}</code> × <code>Swizzle&lt;{sw.B},{sw.M},{sw.S}&gt;</code>
-        </div>
+      <div class={`conflict-meter__way conflict-meter__way--${status}`}>
+        {way === 1 ? 'no conflict · 1 cycle' : `${way}-way · ${way} cycles`}
+      </div>
+      <div class="conflict-meter__detail">
+        pattern <code>{pat.id}</code> × <code>Swizzle&lt;{sw.B},{sw.M},{sw.S}&gt;</code>
       </div>
 
-      <p class="conflict-meter__desc">
-        pattern <code>{pat.name}</code>: {pat.description}
-      </p>
-
       <div class="conflict-meter__compare">
-        <div class="conflict-meter__compare-head">all swizzles</div>
+        <div class="conflict-meter__compare-head">
+          all swizzles <span class="conflict-meter__compare-hint">· lower = better</span>
+        </div>
         {allWays.map(({ kind, way: w }) => (
           <button
             key={kind}
@@ -50,7 +48,10 @@ export function ConflictMeter() {
             onClick={() => (spec.value = { ...s, swizzle: kind })}
             title={`switch to ${kind}`}
           >
-            <span class="conflict-meter__row-kind">{kind}</span>
+            <span class="conflict-meter__row-kind">
+              {kind}
+              {w === bestWay && <span class="conflict-meter__best-tag">best</span>}
+            </span>
             <span class="conflict-meter__row-bar">
               <span
                 class="conflict-meter__row-fill"
@@ -64,19 +65,12 @@ export function ConflictMeter() {
         ))}
       </div>
 
-      {cs.length > 0 && (
-        <div class="conflict-meter__banks">
-          <div class="conflict-meter__banks-head">top hot banks</div>
-          <ul>
-            {cs.slice(0, 5).map((c) => (
-              <li>
-                bank <code>{c.bank}</code> ← {c.way} lanes: [{c.lanes.slice(0, 6).join(', ')}
-                {c.lanes.length > 6 ? '…' : ''}]
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+      <TruthFooter
+        verified
+        models="per-swizzle max-way for the active pattern; element-size M upcast."
+        schematic="leaderboard compares atoms at the same pattern — does not rank by actual cycle cost under replay."
+        cite="swizzle.ts · effectiveSwizzle, patterns.ts · maxConflictWay"
+      />
     </div>
   );
 }

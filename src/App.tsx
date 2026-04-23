@@ -1,20 +1,93 @@
+import { useState } from 'preact/hooks';
 import { ConfigBar } from './panels/ConfigBar';
 import { SmemPanel } from './panels/SmemPanel';
+import { TileHierarchyPanel } from './panels/TileHierarchyPanel';
+import { MemFlowPanel } from './panels/MemFlowPanel';
+import { GmemPanel } from './panels/GmemPanel';
 import { TmemPanel } from './panels/TmemPanel';
-import { RmemPanel } from './panels/RmemPanel';
+import { SimtRegPanel } from './panels/SimtRegPanel';
 import { Timeline } from './panels/Timeline';
 import { ConflictMeter } from './panels/ConflictMeter';
-import { BitfieldPanel } from './panels/BitfieldPanel';
+import { ConflictMatrix } from './panels/ConflictMatrix';
 import { CutlassTokens } from './panels/CutlassTokens';
-import { RfBanksPanel } from './panels/RfBanksPanel';
 import { SmemBudgetPanel } from './panels/SmemBudgetPanel';
 import { buildDescriptor } from './descriptor';
-import { activeSwizzle, inst, spec } from './state';
+import {
+  activeSwizzle,
+  inst,
+  spec,
+  warpSel,
+  warpsInGroup,
+  laneSel,
+  densityMode,
+} from './state';
+
+function SimtStrip() {
+  const warps = warpsInGroup.value;
+  const w = warpSel.value;
+  const l = laneSel.value;
+  const d = densityMode.value;
+  const [showHelp, setShowHelp] = useState(false);
+  return (
+    <>
+      <div class="simt-strip">
+        <span class="simt-strip__label">warpgroup</span>
+        <div class="simt-strip__warps">
+          {Array.from({ length: warps }, (_, i) => (
+            <button
+              class={`simt-strip__warp ${i === w ? 'is-active' : ''}`}
+              onClick={() => (warpSel.value = i)}
+              title={`warp ${i} (32 lanes)`}
+            >
+              W{i}
+            </button>
+          ))}
+        </div>
+        <span class="simt-strip__sep">·</span>
+        <span class="simt-strip__label">lane</span>
+        <button
+          class={`simt-strip__lane ${l == null ? 'is-null' : ''}`}
+          onClick={() => (laneSel.value = l == null ? 0 : null)}
+          title="cycle lane focus (also: key l)"
+        >
+          {l == null ? 'none' : `L${l.toString().padStart(2, '0')}`}
+        </button>
+        <div class="simt-strip__density">
+          <button class={d === 'compact' ? 'is-active' : ''} onClick={() => (densityMode.value = 'compact')}>compact</button>
+          <button class={d === 'detail' ? 'is-active' : ''} onClick={() => (densityMode.value = 'detail')}>detail</button>
+        </div>
+        <span class="simt-strip__help" title="keyboard shortcuts" onClick={() => setShowHelp(true)}>?</span>
+      </div>
+      {showHelp && <KbdOverlay onClose={() => setShowHelp(false)} />}
+    </>
+  );
+}
+
+function KbdOverlay({ onClose }: { onClose: () => void }) {
+  return (
+    <div class="kbd-overlay" onClick={onClose}>
+      <div class="kbd-overlay__inner" onClick={(e: Event) => e.stopPropagation()}>
+        <h3>keyboard</h3>
+        <dl>
+          <dt>space</dt><dd>play / pause</dd>
+          <dt>← →</dt><dd>±1 tick</dd>
+          <dt>shift + ← →</dt><dd>prev / next phase</dd>
+          <dt>[ ]</dt><dd>prev / next replay cycle</dd>
+          <dt>l</dt><dd>cycle lane focus</dd>
+          <dt>w</dt><dd>cycle warp focus</dd>
+          <dt>d</dt><dd>toggle density</dd>
+        </dl>
+        <button class="kbd-overlay__close" onClick={onClose}>close</button>
+      </div>
+    </div>
+  );
+}
 
 export function App() {
   const i = inst.value;
   const sw = activeSwizzle.value;
   const s = spec.value;
+  const d = densityMode.value;
 
   const descArch = i.arch === 'sm100' ? 'sm100' : 'sm90';
   const desc = buildDescriptor({
@@ -26,7 +99,7 @@ export function App() {
   });
 
   return (
-    <main>
+    <main data-density={d}>
       <div class="sticky-top">
         <header>
           <h1>swizzle matmul</h1>
@@ -37,8 +110,10 @@ export function App() {
           </span>
         </header>
         <ConfigBar />
-        <Timeline />
+        <SimtStrip />
       </div>
+
+      <Timeline />
 
       <div class="body-grid">
         <div class="main-column">
@@ -48,13 +123,23 @@ export function App() {
               <h2>Memory hierarchy</h2>
               <p>physical layout of SMEM, TMEM, and the register file as the kernel moves data GMEM → SMEM → LRF → TMEM → GMEM.</p>
             </header>
-            <SmemBudgetPanel />
-            <SmemPanel />
-            <div class="panels-row">
-              <TmemPanel />
-              <RmemPanel />
-            </div>
-            <RfBanksPanel />
+            <TileHierarchyPanel />
+            <MemFlowPanel />
+            {/* GmemPanel, SmemBudgetPanel, SmemPanel, ConflictMatrix: all
+                hidden for wmma because that path does not stage operands
+                through SMEM (no swizzle, no bank mapping, no ring buffer).
+                For sm_80 mma and sm_90/100 the full SMEM swizzle story
+                applies. */}
+            {i.family !== 'wmma' && (
+              <>
+                <GmemPanel />
+                <SmemBudgetPanel />
+                <SmemPanel />
+                <ConflictMatrix />
+              </>
+            )}
+            <TmemPanel />
+            <SimtRegPanel />
           </section>
 
           <section class="section section--reference">
@@ -100,14 +185,18 @@ export function App() {
           </section>
         </div>
 
-        <aside class="swizzle-sidebar">
-          <header class="section__header section__header--tight">
-            <span class="section__rail section__rail--analysis" />
-            <h2>Swizzle analysis</h2>
-          </header>
-          <ConflictMeter />
-          <BitfieldPanel />
-        </aside>
+        {/* Swizzle analysis sidebar is only meaningful for families that
+            stage operands through swizzled SMEM. wmma reads straight from
+            gmem/shared into the fragment, so there's nothing to rank. */}
+        {i.family !== 'wmma' && (
+          <aside class="swizzle-sidebar">
+            <header class="section__header section__header--tight">
+              <span class="section__rail section__rail--analysis" />
+              <h2>Swizzle analysis</h2>
+            </header>
+            <ConflictMeter />
+          </aside>
+        )}
       </div>
     </main>
   );

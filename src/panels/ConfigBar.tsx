@@ -1,4 +1,18 @@
-import { activePatternId, commitConfig, commitMode, inst, modeConfig, spec, wgmmaShowAllShapes } from '../state';
+import {
+  activePatternId,
+  blkMMult,
+  blkNMult,
+  commitConfig,
+  commitMode,
+  inst,
+  modeConfig,
+  pipelineMode,
+  problemKMult,
+  problemMMult,
+  problemNMult,
+  spec,
+  wgmmaShowAllShapes,
+} from '../state';
 import { SWIZZLES, type SwizzleKind } from '../swizzle';
 import { PATTERNS } from '../patterns';
 import {
@@ -170,6 +184,73 @@ export function ConfigBar() {
             display={(id) => PATTERNS[id as string].name}
             onChange={(v) => (activePatternId.value = v as string)}
           />
+        </div>
+
+        {/* CUTLASS TileShape multipliers. `inst.M/N` is the MMA atom shape;
+            multiplying gives BLK_M / BLK_N as in `TiledMMA<AtomLayoutMNK>`.
+            Hidden for wmma because sm_70/75 kernels don't use the Hopper-
+            era collective-builder tile hierarchy. */}
+        {mode !== 'wmma' && (
+          <div class="configbar-v2__group">
+            <span class="configbar-v2__label">tile</span>
+            <Select
+              label="BLK_M"
+              value={blkMMult.value}
+              options={[1, 2, 4]}
+              display={(n) => `${n}× (${Number(n) * i.M})`}
+              onChange={(v) => (blkMMult.value = Number(v))}
+            />
+            <Select
+              label="BLK_N"
+              value={blkNMult.value}
+              options={[1, 2, 4]}
+              display={(n) => `${n}× (${Number(n) * i.N})`}
+              onChange={(v) => (blkNMult.value = Number(v))}
+            />
+          </div>
+        )}
+
+        {/* GMEM problem size — integer multiples of the CTA tile. Drives the
+            GmemPanel drawing (how many CTA tiles fit on each axis). Display-
+            only: no memory cost. Hidden for wmma (gmem-wmma path doesn't use
+            TMA and we don't draw a problem-level view for it). */}
+        {mode !== 'wmma' && (
+          <div class="configbar-v2__group">
+            <span class="configbar-v2__label">problem</span>
+            <Select
+              label="M_prob"
+              value={problemMMult.value}
+              options={[2, 4, 8]}
+              display={(n) => `${n}× (${Number(n) * i.M * blkMMult.value})`}
+              onChange={(v) => (problemMMult.value = Number(v))}
+            />
+            <Select
+              label="N_prob"
+              value={problemNMult.value}
+              options={[2, 4, 8]}
+              display={(n) => `${n}× (${Number(n) * i.N * blkNMult.value})`}
+              onChange={(v) => (problemNMult.value = Number(v))}
+            />
+            <Select
+              label="K_prob"
+              value={problemKMult.value}
+              options={[2, 4, 8]}
+              display={(n) => `${n}× slabs`}
+              onChange={(v) => (problemKMult.value = Number(v))}
+            />
+          </div>
+        )}
+
+        {/* Pipeline regime readout — derived from the instruction family,
+            not user-settable. Teal pill for warp-specialized async (producer
+            TMA ∥ consumer MMA warps), gray pill for coupled (same warp). */}
+        <div class="configbar-v2__group">
+          <span class="configbar-v2__label">pipeline</span>
+          <span class={`configbar-v2__pill configbar-v2__pill--${pipelineMode.value}`}>
+            {pipelineMode.value === 'warpspec'
+              ? 'ASYNC · producer ∥ consumer'
+              : 'SYNC · same warp'}
+          </span>
         </div>
 
         {mode === 'wgmma' && (

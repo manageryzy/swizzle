@@ -1,7 +1,17 @@
 import { useState } from 'preact/hooks';
-import { activeSwizzle, inst, spec } from '../state';
+import {
+  activeSwizzle,
+  blkMMult,
+  blkNMult,
+  clusterShape,
+  inst,
+  kStages,
+  spec,
+  tileK,
+} from '../state';
 import { LayoutType, layoutTypeOf, type Swizzle } from '../swizzle';
 import type { InstSpec } from '../instructions';
+import { TruthFooter } from './TruthFooter';
 
 // Translate the current UI config into the CUTLASS/cute tokens a user would
 // write in their own code. Pure display — no side effects beyond the copy
@@ -64,16 +74,44 @@ export function CutlassTokens() {
         <dt>arch tag</dt>
         <dd><code>{archTag(i.arch)}</code></dd>
 
+        <dt>TileShape</dt>
+        <dd>
+          <code>
+            Shape&lt;_{i.M * blkMMult.value}, _{i.N * blkNMult.value}, _{tileK.value}&gt;
+          </code>
+        </dd>
+
+        <dt>ClusterShape</dt>
+        <dd>
+          <code>
+            Shape&lt;_{clusterShape.value[0]}, _{clusterShape.value[1]}, _{clusterShape.value[2]}&gt;
+          </code>
+        </dd>
+
+        <dt>StageCount</dt>
+        <dd>
+          <code>cutlass::gemm::collective::StageCountAuto /* = {kStages.value} */</code>
+        </dd>
+
         <dt>inst atom</dt>
         <dd><code>{i.mnemonic}</code></dd>
 
-        <dt>swizzle atom (A)</dt>
+        <dt>
+          swizzle atom (A)
+          <span class="truth__verified">verified vs cute</span>
+        </dt>
         <dd><code>{swizzleAtomName(s.majorA, sw)}&lt;ElementA&gt;</code></dd>
 
-        <dt>swizzle atom (B)</dt>
+        <dt>
+          swizzle atom (B)
+          <span class="truth__verified">verified vs cute</span>
+        </dt>
         <dd><code>{swizzleAtomName(s.majorB, sw)}&lt;ElementB&gt;</code></dd>
 
-        <dt>Swizzle&lt;B,M,S&gt;</dt>
+        <dt>
+          Swizzle&lt;B,M,S&gt;
+          <span class="truth__verified">verified vs cute</span>
+        </dt>
         <dd><code>Swizzle&lt;{sw.B},{sw.M},{sw.S}&gt;</code></dd>
 
         <dt>descriptor layout_type</dt>
@@ -102,8 +140,16 @@ export function CutlassTokens() {
       <p class="cutlass__foot">
         builder lives under <code>cutlass/gemm/collective/builders/</code>; each
         arch has its own dispatch file (sm90_*, sm100_*). Cite:{' '}
-        <code>{i.source}</code>.
+        <code>{i.source}</code>. The CTA tile is carved out of a GMEM tensor
+        via <code>local_tile(mA, make_shape(BLK_M, BLK_K), tile_coord)</code>{' '}
+        (<code>cute/algorithm/tile.hpp</code>) and fanned across atoms via{' '}
+        <code>TiledMMA&lt;AtomLayoutMNK&gt;</code> (<code>cute/atom/atom.hpp</code>).
       </p>
+      <TruthFooter
+        verified
+        models="arch tag, inst mnemonic, cute swizzle atom name, Swizzle<B,M,S> tuple (verified vs cute), ClusterShape, A operand source (SS/RS/TS), ctaGroup"
+        schematic="kernel schedule / collective builder signature — guidance, not a compile-checked template"
+      />
     </div>
   );
 }
